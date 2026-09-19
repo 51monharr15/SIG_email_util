@@ -1,0 +1,1 @@
+cd stroke/SIG_email_util && /usr/local/bin/php cron/reengage_inactive.php --dry-run --limit=20 >> reengage_log.txt 2>&1
