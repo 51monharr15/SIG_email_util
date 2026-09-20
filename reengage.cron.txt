@@ -1,1 +1,1 @@
-cd stroke/SIG_email_util && /usr/local/bin/php cron/reengage_inactive.php --dry-run --limit=20 >> reengage_log.txt 2>&1
+/usr/local/bin/php -d date.timezone=Europe/London /home/logicalm/stroke/SIG_email_util/cron/reengage_inactive.php --dry-run >> /home/logicalm/stroke/SIG_email_util/reengage_log.txt 2>&1

@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html>
+<head>
+<!--
+  Reminder / digest bands. Edit in WYSIWYG / TryIt; keep {{placeholders}} and band markers.
+
+  Placeholders (examples):
+    {{name}} = Alex
+    {{forum}} = Stroke Community
+    {{base_url}} = https://stroke.logicalmodel.net
+    {{joined_on}} = 12 Mar 2025
+    {{last_visited}} = 3 Jan 2026
+    {{days_ago}} = 95
+    {{profile_url}} = https://stroke.logicalmodel.net/settings
+    {{thread_list}} = count of new threads + first N links (digest/away)
+    {{new_since_count}} = 42
+    {{popular}} = busy recent threads
+
+  Markers:
+    [band:digest subject:…] … [/band:digest]
+-->
+</head>
+<body>
+
+<!-- band:digest subject:Recent activity at {{forum}} -->
+<p>Hello {{name}},</p>
+<p>It has been about {{days_ago}} days since your last visit to {{forum}}
+(last seen {{last_visited}}). Here is a short digest of what has been happening.</p>
+{{thread_list}}
+<p><strong>Popular lately</strong></p>
+{{popular}}
+<p>Visit whenever you like: <a href="{{base_url}}">{{base_url}}</a></p>
+<p>— {{forum}}</p>
+<!-- /band:digest -->
+
+<!-- band:away subject:We noticed you have not been around — {{forum}} -->
+<p>Hello {{name}},</p>
+<p>We notice you have not been around {{forum}} lately
+(last visit {{last_visited}}, about {{days_ago}} days ago). You are welcome back whenever it suits you.</p>
+{{thread_list}}
+<p><strong>Popular lately</strong></p>
+{{popular}}
+<p><strong>Please complete your profile</strong> if you have not yet — your name (top right) → <strong>Settings</strong>,
+or <a href="{{profile_url}}">{{profile_url}}</a>.</p>
+<p>Visit whenever you like: <a href="{{base_url}}">{{base_url}}</a></p>
+<p>— {{forum}}</p>
+<!-- /band:away -->
+
+<!-- band:long subject:A reminder from {{forum}} -->
+<p>Hello {{name}},</p>
+<p>It has been a good while since you last visited {{forum}}
+({{last_visited}}, about {{days_ago}} days ago). No pressure — this is just a reminder that your login is still here.</p>
+<p><strong>Popular lately</strong></p>
+{{popular}}
+<p>Find us again at <a href="{{base_url}}">{{base_url}}</a></p>
+<p>— {{forum}}</p>
+<!-- /band:long -->
+
+<!-- band:dormant subject:You still have a login at {{forum}} -->
+<p>Hello {{name}},</p>
+<p>It has been a long time since you last visited {{forum}}
+({{last_visited}}, about {{days_ago}} days ago). Your account is still here if you ever want it.</p>
+<p>Here is how to find us again: <a href="{{base_url}}">{{base_url}}</a></p>
+<p>If you would like others to know a little about you,
+your name (top right) → <strong>Settings</strong>, or <a href="{{profile_url}}">{{profile_url}}</a>.</p>
+<p>— {{forum}}</p>
+<!-- /band:dormant -->
+
+</body>
+</html>

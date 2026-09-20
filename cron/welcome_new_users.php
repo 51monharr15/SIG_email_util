@@ -2,15 +2,11 @@
 /**
  * Daily: welcome emails for recent signups.
  *
- * Dry-run by default (config mail.dry_run or omit --send).
+ * File log explains everyone in the lookback window.
+ * Database updated only on real successful send (sig_mail_state + thin sent log).
  *
- *   php cron/welcome_new_users.php
  *   php cron/welcome_new_users.php --dry-run
- *   php cron/welcome_new_users.php --send --limit=5
- *   php cron/welcome_new_users.php --send --user-id=123
- *
- * cPanel cron example (daily ~09:00):
- *   /usr/local/bin/php /home/USER/path/to/SIG-Stakeholder-Database/cron/welcome_new_users.php --send
+ *   php cron/welcome_new_users.php --send
  */
 
 require_once dirname(__DIR__) . '/lib/bootstrap.php';
@@ -30,12 +26,13 @@ $pdo = sig_pdo($config);
 $usersTable = sig_table($config, 'users');
 $lookback = (int) ($config['welcome']['lookback_hours'] ?? 36);
 $requireConfirmed = (bool) ($config['welcome']['require_confirmed'] ?? true);
+$activeAfter = max(0, (int) ($config['welcome']['already_active_after_days'] ?? 1));
 $since = date('Y-m-d H:i:s', time() - max(1, $lookback) * 3600);
 
 sig_log('welcome_new_users starting; mode=' . ($args['dry_run'] ? 'DRY-RUN' : 'SEND')
     . "; lookback_hours={$lookback}; since={$since}");
 
-$sql = "SELECT id, username, nickname, email, joined_at, is_email_confirmed, preferences
+$sql = "SELECT id, username, nickname, email, joined_at, last_seen_at, is_email_confirmed
         FROM {$usersTable}
         WHERE joined_at >= :since
           AND email IS NOT NULL AND email <> ''
@@ -58,49 +55,58 @@ $stmt = $pdo->prepare($sql);
 $stmt->execute($params);
 $candidates = $stmt->fetchAll();
 
-$stats = ['candidates' => count($candidates), 'sent' => 0, 'dry_run' => 0, 'skipped' => 0, 'error' => 0];
+$stats = ['candidates' => count($candidates), 'sent' => 0, 'would_send' => 0, 'nothing' => 0, 'error' => 0];
 
 foreach ($candidates as $user) {
     $uid = (int) $user['id'];
     $email = (string) $user['email'];
+    $label = "uid={$uid} {$email}";
 
     if (sig_already_sent_welcome($pdo, $uid)) {
-        sig_log("skip user {$uid} {$email}: welcome already sent");
-        sig_mail_log_insert($pdo, $uid, $email, 'welcome', null, 'skipped', '', 'already_sent');
-        $stats['skipped']++;
+        sig_log("NOTHING {$label} : welcome already sent");
+        $stats['nothing']++;
         continue;
     }
 
-    // Also skip if a prior dry_run logged for same user in lookback? No — allow dry_run repeats; only 'sent' blocks.
+    $joinedTs = strtotime((string) $user['joined_at']);
+    $seenRaw = $user['last_seen_at'] ?? null;
+    if ($joinedTs && $seenRaw) {
+        $seenTs = strtotime((string) $seenRaw);
+        if ($seenTs && $seenTs > $joinedTs) {
+            $activeDays = (int) floor(($seenTs - $joinedTs) / 86400);
+            if ($activeDays >= $activeAfter) {
+                sig_log("NOTHING {$label} : already active (last_seen {$activeDays}d after join)");
+                $stats['nothing']++;
+                continue;
+            }
+        }
+    }
 
     if (!$args['dry_run'] && !sig_in_allowlist($config, $email)) {
-        sig_log("skip user {$uid} {$email}: not on allowlist");
-        sig_mail_log_insert($pdo, $uid, $email, 'welcome', null, 'skipped', '', 'not_on_allowlist');
-        $stats['skipped']++;
+        sig_log("NOTHING {$label} : not on allowlist");
+        $stats['nothing']++;
         continue;
     }
 
     $msg = sig_welcome_message($config, $user);
 
     if ($args['dry_run']) {
-        sig_log("DRY-RUN welcome -> {$email} | {$msg['subject']}");
-        sig_mail_log_insert($pdo, $uid, $email, 'welcome', null, 'dry_run', $msg['subject'], null, [
-            'joined_at' => $user['joined_at'],
-        ]);
-        $stats['dry_run']++;
+        sig_log("WOULD-SEND welcome {$label} | {$msg['subject']}");
+        $stats['would_send']++;
         continue;
     }
 
     $result = sig_send_mail($config, $email, $msg['subject'], $msg['text'], $msg['html']);
     if ($result['ok']) {
-        sig_log("SENT welcome -> {$email}");
+        sig_state_mark_welcome($pdo, $uid);
         sig_mail_log_insert($pdo, $uid, $email, 'welcome', null, 'sent', $msg['subject'], null, [
             'joined_at' => $user['joined_at'],
         ]);
+        sig_log("SENT welcome {$label} | {$msg['subject']}");
         $stats['sent']++;
     } else {
-        sig_log("ERROR welcome -> {$email}: {$result['error']}");
         sig_mail_log_insert($pdo, $uid, $email, 'welcome', null, 'error', $msg['subject'], $result['error']);
+        sig_log("ERROR welcome {$label}: {$result['error']}");
         $stats['error']++;
     }
 }

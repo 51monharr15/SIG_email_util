@@ -1,17 +1,15 @@
 <?php
 /**
- * Weekly: re-engage users inactive for >= n days with new-thread digests.
+ * Reminder / digest job: classify every member, file-log everyone,
+ * DB state only on real sends.
  *
- * Tiers (kindness): soft (n..2n), softer (2n..3n), gentle (>=3n).
- * Discussions grouped by primary tag/category, then by age.
- *
- *   php cron/reengage_inactive.php
- *   php cron/reengage_inactive.php --dry-run --limit=10
- *   php cron/reengage_inactive.php --send --n-days=30
+ *   php cron/reengage_inactive.php --dry-run
+ *   php cron/reengage_inactive.php --send
+ *   php cron/reengage_inactive.php --dry-run --limit=50
  *   php cron/reengage_inactive.php --send --user-id=123
  *
- * cPanel cron example (weekly Monday 10:00):
- *   /usr/local/bin/php /home/USER/path/to/SIG-Stakeholder-Database/cron/reengage_inactive.php --send
+ * Cron (this host):
+ *   /usr/local/bin/php -d date.timezone=Europe/London /home/logicalm/stroke/SIG_email_util/cron/reengage_inactive.php --dry-run >> /home/logicalm/stroke/SIG_email_util/reengage_log.txt 2>&1
  */
 
 require_once dirname(__DIR__) . '/lib/bootstrap.php';
@@ -23,204 +21,149 @@ $config = sig_load_config();
 $args = sig_parse_args($argv, $config);
 
 if ($args['help']) {
-    echo "Usage: php reengage_inactive.php [--dry-run|--send] [--limit=N] [--user-id=N] [--n-days=N]\n";
+    echo "Usage: php reengage_inactive.php [--dry-run|--send] [--limit=N] [--user-id=N]\n";
     exit(0);
 }
 
 $pdo = sig_pdo($config);
 $usersTable = sig_table($config, 'users');
 $discTable  = sig_table($config, 'discussions');
-$tagTable   = sig_table($config, 'tags');
-$dtTable    = sig_table($config, 'discussion_tag');
 
-$n = $args['n_days'] ?? (int) ($config['reengage']['n_days'] ?? 30);
-$n = max(1, (int) $n);
-$extraNs = $config['reengage']['extra_n_days'] ?? [];
-if (!is_array($extraNs)) {
-    $extraNs = [];
+$showNew = (int) (($config['reminders']['new_since_show'] ?? 5));
+if (!in_array($showNew, [3, 5, 10], true)) {
+    $showNew = max(1, $showNew);
 }
-// This run uses one n (primary or overridden). Separate cron lines can pass --n-days=180.
-$maxThreads = max(1, (int) ($config['reengage']['max_threads'] ?? 30));
-$honourPrefs = (bool) ($config['reengage']['honour_email_prefs'] ?? true);
-$minInterval = max(1, (int) ($config['reengage']['min_interval_days'] ?? 6));
-$cutoff = date('Y-m-d H:i:s', time() - $n * 86400);
+$activeBefore = sig_active_threshold_days($config);
+$popular = sig_fetch_popular_threads($pdo, $config);
 
-sig_log('reengage_inactive starting; mode=' . ($args['dry_run'] ? 'DRY-RUN' : 'SEND')
-    . "; n_days={$n}; cutoff={$cutoff}");
+sig_log('reminders starting; mode=' . ($args['dry_run'] ? 'DRY-RUN' : 'SEND')
+    . "; active_if_under={$activeBefore}d; new_since_show={$showNew}; popular=" . count($popular));
 
-$sql = "SELECT id, username, nickname, email, last_seen_at, preferences, joined_at
+$sql = "SELECT id, username, nickname, email, last_seen_at, joined_at
         FROM {$usersTable}
         WHERE email IS NOT NULL AND email <> ''
-          AND last_seen_at IS NOT NULL
-          AND last_seen_at <= :cutoff
           AND (suspended_until IS NULL OR suspended_until < NOW())";
-$params = [':cutoff' => $cutoff];
+$params = [];
 
 if ($args['user_id'] !== null) {
     $sql .= ' AND id = :uid';
     $params[':uid'] = $args['user_id'];
 }
-$sql .= ' ORDER BY last_seen_at ASC';
+$sql .= ' ORDER BY id ASC';
 if ($args['limit'] !== null) {
     $sql .= ' LIMIT ' . (int) $args['limit'];
 }
 
 $stmt = $pdo->prepare($sql);
 $stmt->execute($params);
-$candidates = $stmt->fetchAll();
+$users = $stmt->fetchAll();
 
 $threadStmt = $pdo->prepare(
-    "SELECT d.id, d.title, d.slug, d.created_at,
-            COALESCE(t.name, 'Uncategorised') AS category,
-            COALESCE(t.position, 9999) AS tag_position,
-            CASE WHEN t.parent_id IS NULL THEN 0 ELSE 1 END AS tag_depth
+    "SELECT d.id, d.title, d.slug, d.created_at
      FROM {$discTable} d
-     LEFT JOIN {$dtTable} dt ON dt.discussion_id = d.id
-     LEFT JOIN {$tagTable} t ON t.id = dt.tag_id
      WHERE d.created_at > :since
        AND d.hidden_at IS NULL
        AND (d.is_private = 0 OR d.is_private IS NULL)
-     ORDER BY tag_depth ASC, tag_position ASC, category ASC, d.created_at DESC"
+     ORDER BY d.created_at DESC"
 );
 
 $stats = [
-    'candidates' => count($candidates),
+    'users' => count($users),
+    'nothing' => 0,
+    'would_send' => 0,
     'sent' => 0,
-    'dry_run' => 0,
-    'skipped' => 0,
     'error' => 0,
-    'by_tier' => ['soft' => 0, 'softer' => 0, 'gentle' => 0],
+    'by_kind' => [],
 ];
 
-foreach ($candidates as $user) {
+foreach ($users as $user) {
     $uid = (int) $user['id'];
     $email = (string) $user['email'];
-    $lastSeen = (string) $user['last_seen_at'];
+    $lastSeen = $user['last_seen_at'] !== null ? (string) $user['last_seen_at'] : '';
+    $label = "uid={$uid} {$email}";
+
+    if ($lastSeen === '' || $lastSeen === '0000-00-00 00:00:00') {
+        sig_log("NOTHING {$label} : no last_seen_at");
+        $stats['nothing']++;
+        continue;
+    }
+
     $daysAway = (int) floor((time() - strtotime($lastSeen)) / 86400);
-    $tier = sig_reengage_tier($daysAway, $n);
+    $state = sig_state_get($pdo, $uid);
 
-    if (!sig_allow_reengage_pref($pdo, $uid)) {
-        sig_log("skip user {$uid}: sig_mail_prefs.allow_reengage=0");
-        sig_mail_log_insert($pdo, $uid, $email, 'reengage', $tier, 'skipped', '', 'pref_opt_out');
-        $stats['skipped']++;
+    $kind = sig_never_engaged_kind($config, $user, $daysAway);
+    $primed = $kind !== null;
+    if ($kind === null) {
+        $kind = sig_band_for_days($config, $daysAway);
+    }
+
+    if ($kind === null) {
+        sig_log("NOTHING {$label} : active ({$daysAway}d < {$activeBefore}d)");
+        $stats['nothing']++;
         continue;
     }
 
-    if ($honourPrefs && !sig_flarum_allows_email($user['preferences'] ?? null)) {
-        sig_log("skip user {$uid}: Flarum email prefs all off");
-        sig_mail_log_insert($pdo, $uid, $email, 'reengage', $tier, 'skipped', '', 'flarum_email_prefs_off');
-        $stats['skipped']++;
-        continue;
-    }
-
-    $last = sig_last_reengage_at($pdo, $uid);
-    if ($last !== null) {
-        $elapsed = time() - strtotime($last);
-        if ($elapsed < $minInterval * 86400) {
-            sig_log("skip user {$uid}: reengage within min_interval_days");
-            sig_mail_log_insert($pdo, $uid, $email, 'reengage', $tier, 'skipped', '', 'min_interval');
-            $stats['skipped']++;
+    $interval = sig_band_interval($config, $kind);
+    if ($state && !empty($state['last_sent_at'])) {
+        $elapsed = time() - strtotime((string) $state['last_sent_at']);
+        if ($elapsed < $interval * 86400) {
+            $prev = (string) ($state['last_kind'] ?? '?');
+            $when = (string) $state['last_sent_at'];
+            sig_log("NOTHING {$label} : too soon (last={$prev} on {$when}, need {$interval}d gap; away {$daysAway}d would be {$kind}"
+                . ($primed ? ', never-engaged' : '') . ')');
+            $stats['nothing']++;
             continue;
         }
     }
 
     if (!$args['dry_run'] && !sig_in_allowlist($config, $email)) {
-        sig_log("skip user {$uid} {$email}: not on allowlist");
-        sig_mail_log_insert($pdo, $uid, $email, 'reengage', $tier, 'skipped', '', 'not_on_allowlist');
-        $stats['skipped']++;
+        sig_log("NOTHING {$label} : not on allowlist");
+        $stats['nothing']++;
         continue;
     }
 
     $threadStmt->execute([':since' => $lastSeen]);
     $rows = $threadStmt->fetchAll();
-
-    // Dedupe discussions (multiple tags) — keep first (primary-ish) category
-    $seen = [];
-    $byCat = [];
+    $allNew = [];
     foreach ($rows as $row) {
         $did = (int) $row['id'];
-        if (isset($seen[$did])) {
-            continue;
-        }
-        $seen[$did] = true;
-        $cat = (string) $row['category'];
-        if (!isset($byCat[$cat])) {
-            $byCat[$cat] = [
-                'category' => $cat,
-                'position' => (int) $row['tag_position'],
-                'threads'  => [],
-            ];
-        }
-        if (count_threads($byCat) >= $maxThreads) {
-            break;
-        }
-        $byCat[$cat]['threads'][] = [
-            'id'         => $did,
-            'title'      => (string) $row['title'],
-            'slug'       => (string) ($row['slug'] ?? ''),
-            'created_at' => (string) $row['created_at'],
-            'url'        => sig_discussion_url($config, $did, (string) ($row['slug'] ?? '')),
+        $allNew[] = [
+            'id'    => $did,
+            'title' => (string) $row['title'],
+            'url'   => sig_discussion_url($config, $did, (string) ($row['slug'] ?? '')),
         ];
     }
-
-    // Sort categories by tag position; within each, threads already newest-first from SQL —
-    // user asked organised by category and within category by age (oldest first reads naturally in digest).
-    uasort($byCat, function ($a, $b) {
-        return $a['position'] <=> $b['position'] ?: strcmp($a['category'], $b['category']);
-    });
-    $grouped = [];
-    foreach ($byCat as $block) {
-        usort($block['threads'], function ($a, $b) {
-            return strcmp($a['created_at'], $b['created_at']); // age ascending
-        });
-        if ($block['threads'] !== []) {
-            $grouped[] = ['category' => $block['category'], 'threads' => $block['threads']];
-        }
-    }
-
-    $msg = sig_reengage_message($config, $user, $tier, $daysAway, $grouped);
-    $meta = [
-        'days_away'     => $daysAway,
-        'n_days'        => $n,
-        'last_seen_at'  => $lastSeen,
-        'thread_count'  => array_sum(array_map(function ($g) { return count($g['threads']); }, $grouped)),
-        'categories'    => array_map(function ($g) { return $g['category']; }, $grouped),
+    $newSince = [
+        'total' => count($allNew),
+        'shown' => array_slice($allNew, 0, $showNew),
     ];
 
+    $msg = sig_reminder_message($config, $user, $kind, $daysAway, $newSince, $popular);
+    $stats['by_kind'][$kind] = ($stats['by_kind'][$kind] ?? 0) + 1;
+
     if ($args['dry_run']) {
-        sig_log("DRY-RUN reengage [{$tier}] {$daysAway}d -> {$email} | threads={$meta['thread_count']} | {$msg['subject']}");
-        sig_mail_log_insert($pdo, $uid, $email, 'reengage', $tier, 'dry_run', $msg['subject'], null, $meta);
-        $stats['dry_run']++;
-        $stats['by_tier'][$tier]++;
+        sig_log("WOULD-SEND {$kind} {$label} {$daysAway}d"
+            . ($primed ? ' (never-engaged)' : '')
+            . " | {$msg['subject']}");
+        $stats['would_send']++;
         continue;
     }
 
     $result = sig_send_mail($config, $email, $msg['subject'], $msg['text'], $msg['html']);
     if ($result['ok']) {
-        sig_log("SENT reengage [{$tier}] -> {$email}");
-        sig_mail_log_insert($pdo, $uid, $email, 'reengage', $tier, 'sent', $msg['subject'], null, $meta);
+        sig_state_mark_reminder($pdo, $uid, $kind);
+        sig_mail_log_insert($pdo, $uid, $email, $kind, null, 'sent', $msg['subject'], null, [
+            'days_away' => $daysAway,
+            'primed'    => $primed,
+        ]);
+        sig_log("SENT {$kind} {$label} {$daysAway}d | {$msg['subject']}");
         $stats['sent']++;
-        $stats['by_tier'][$tier]++;
     } else {
-        sig_log("ERROR reengage -> {$email}: {$result['error']}");
-        sig_mail_log_insert($pdo, $uid, $email, 'reengage', $tier, 'error', $msg['subject'], $result['error'], $meta);
+        sig_mail_log_insert($pdo, $uid, $email, $kind, null, 'error', $msg['subject'], $result['error']);
+        sig_log("ERROR {$kind} {$label}: {$result['error']}");
         $stats['error']++;
     }
 }
 
-sig_log('reengage_inactive done: ' . json_encode($stats));
-if ($extraNs !== [] && $args['n_days'] === null) {
-    sig_log('Note: config reengage.extra_n_days=' . json_encode($extraNs)
-        . ' — run separate cron with --n-days=180 (etc.) for deeper passes.');
-}
+sig_log('reminders done: ' . json_encode($stats));
 exit($stats['error'] > 0 ? 2 : 0);
-
-/** @param array<string, array{threads:array}> $byCat */
-function count_threads(array $byCat): int
-{
-    $n = 0;
-    foreach ($byCat as $b) {
-        $n += count($b['threads']);
-    }
-    return $n;
-}

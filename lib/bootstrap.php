@@ -29,7 +29,25 @@ function sig_load_config(): array
         fwrite(STDERR, "config.php must return an array.\n");
         exit(1);
     }
+    sig_apply_timezone($config);
     return $config;
+}
+
+/**
+ * App-level timezone (dates in logs / email copy).
+ * Does NOT silence the PHP Startup warning if date.timezone is empty in php.ini —
+ * fix that in cPanel MultiPHP INI Editor (see DEVELOPER_GUIDE).
+ */
+function sig_apply_timezone(array $config): void
+{
+    $tz = trim((string) ($config['timezone'] ?? 'Europe/London'));
+    if ($tz === '') {
+        $tz = 'Europe/London';
+    }
+    if (@date_default_timezone_set($tz) === false) {
+        date_default_timezone_set('UTC');
+        fwrite(STDERR, "Invalid config timezone '{$tz}'; using UTC.\n");
+    }
 }
 
 function sig_pdo(array $config): PDO
@@ -137,6 +155,10 @@ function sig_mail_log_insert(
     ?string $skipReason = null,
     ?array $meta = null
 ): void {
+    // Real activity only (sent / error). Dry-runs stay in the file log.
+    if ($status !== 'sent' && $status !== 'error') {
+        return;
+    }
     $stmt = $pdo->prepare(
         'INSERT INTO ' . sig_util_table('sig_mail_log') . '
          (user_id, email, kind, tier, status, subject, skip_reason, meta_json, created_at)
@@ -155,8 +177,49 @@ function sig_mail_log_insert(
     ]);
 }
 
+/**
+ * @return array{welcome_sent_at:?string,last_kind:?string,last_sent_at:?string,updated_at:?string}|null
+ */
+function sig_state_get(PDO $pdo, int $userId): ?array
+{
+    $stmt = $pdo->prepare(
+        'SELECT welcome_sent_at, last_kind, last_sent_at, updated_at
+         FROM ' . sig_util_table('sig_mail_state') . ' WHERE user_id = :uid LIMIT 1'
+    );
+    $stmt->execute([':uid' => $userId]);
+    $row = $stmt->fetch();
+    return $row === false ? null : $row;
+}
+
+function sig_state_mark_welcome(PDO $pdo, int $userId): void
+{
+    $now = date('Y-m-d H:i:s');
+    $pdo->prepare(
+        'INSERT INTO ' . sig_util_table('sig_mail_state') . '
+         (user_id, welcome_sent_at, last_kind, last_sent_at, updated_at)
+         VALUES (:uid, :now, NULL, NULL, :now)
+         ON DUPLICATE KEY UPDATE welcome_sent_at = VALUES(welcome_sent_at), updated_at = VALUES(updated_at)'
+    )->execute([':uid' => $userId, ':now' => $now]);
+}
+
+function sig_state_mark_reminder(PDO $pdo, int $userId, string $kind): void
+{
+    $now = date('Y-m-d H:i:s');
+    $pdo->prepare(
+        'INSERT INTO ' . sig_util_table('sig_mail_state') . '
+         (user_id, welcome_sent_at, last_kind, last_sent_at, updated_at)
+         VALUES (:uid, NULL, :kind, :now, :now)
+         ON DUPLICATE KEY UPDATE last_kind = VALUES(last_kind), last_sent_at = VALUES(last_sent_at), updated_at = VALUES(updated_at)'
+    )->execute([':uid' => $userId, ':kind' => $kind, ':now' => $now]);
+}
+
 function sig_already_sent_welcome(PDO $pdo, int $userId): bool
 {
+    $state = sig_state_get($pdo, $userId);
+    if ($state && !empty($state['welcome_sent_at'])) {
+        return true;
+    }
+    // Legacy fallback from old sig_mail_log rows
     $stmt = $pdo->prepare(
         'SELECT 1 FROM ' . sig_util_table('sig_mail_log') . '
          WHERE user_id = :uid AND kind = \'welcome\' AND status = \'sent\'
@@ -164,63 +227,6 @@ function sig_already_sent_welcome(PDO $pdo, int $userId): bool
     );
     $stmt->execute([':uid' => $userId]);
     return (bool) $stmt->fetchColumn();
-}
-
-function sig_last_reengage_at(PDO $pdo, int $userId): ?string
-{
-    // Only real sends enforce the interval so dry-runs stay repeatable while testing.
-    $stmt = $pdo->prepare(
-        'SELECT created_at FROM ' . sig_util_table('sig_mail_log') . '
-         WHERE user_id = :uid AND kind = \'reengage\' AND status = \'sent\'
-         ORDER BY id DESC LIMIT 1'
-    );
-    $stmt->execute([':uid' => $userId]);
-    $v = $stmt->fetchColumn();
-    return $v === false ? null : (string) $v;
-}
-
-function sig_allow_reengage_pref(PDO $pdo, int $userId): bool
-{
-    $stmt = $pdo->prepare(
-        'SELECT allow_reengage FROM ' . sig_util_table('sig_mail_prefs') . '
-         WHERE user_id = :uid LIMIT 1'
-    );
-    $stmt->execute([':uid' => $userId]);
-    $v = $stmt->fetchColumn();
-    if ($v === false) {
-        return true; // no row = allowed
-    }
-    return (bool) (int) $v;
-}
-
-/**
- * If the user has stored notify_*_email prefs and every one is false, treat as opted out of email digests.
- * Missing / empty preferences => allow (Flarum defaults are extension-dependent).
- */
-function sig_flarum_allows_email(?string $preferencesJson): bool
-{
-    if ($preferencesJson === null || $preferencesJson === '') {
-        return true;
-    }
-    $prefs = json_decode($preferencesJson, true);
-    if (!is_array($prefs)) {
-        return true;
-    }
-    $emailKeys = [];
-    foreach ($prefs as $key => $val) {
-        if (is_string($key) && preg_match('/^notify_.+_email$/', $key)) {
-            $emailKeys[$key] = (bool) $val;
-        }
-    }
-    if ($emailKeys === []) {
-        return true;
-    }
-    foreach ($emailKeys as $on) {
-        if ($on) {
-            return true;
-        }
-    }
-    return false;
 }
 
 function sig_in_allowlist(array $config, string $email): bool
@@ -236,6 +242,99 @@ function sig_in_allowlist(array $config, string $email): bool
         }
     }
     return false;
+}
+
+/**
+ * @return list<array{id:string,min_days:int,max_days:?int,min_interval_days:int}>
+ */
+function sig_reminder_bands(array $config): array
+{
+    $bands = $config['reminders']['bands'] ?? null;
+    if (!is_array($bands) || $bands === []) {
+        return [
+            ['id' => 'digest', 'min_days' => 14, 'max_days' => 44, 'min_interval_days' => 14],
+            ['id' => 'away', 'min_days' => 45, 'max_days' => 90, 'min_interval_days' => 30],
+            ['id' => 'long', 'min_days' => 91, 'max_days' => 180, 'min_interval_days' => 90],
+            ['id' => 'dormant', 'min_days' => 181, 'max_days' => null, 'min_interval_days' => 90],
+        ];
+    }
+    $out = [];
+    foreach ($bands as $b) {
+        if (!is_array($b) || empty($b['id'])) {
+            continue;
+        }
+        $out[] = [
+            'id' => (string) $b['id'],
+            'min_days' => max(0, (int) ($b['min_days'] ?? 0)),
+            'max_days' => array_key_exists('max_days', $b) && $b['max_days'] !== null && $b['max_days'] !== ''
+                ? (int) $b['max_days'] : null,
+            'min_interval_days' => max(1, (int) ($b['min_interval_days'] ?? 90)),
+        ];
+    }
+    return $out;
+}
+
+/**
+ * Pick band id for days-away, or null if still “active” (below first band).
+ */
+function sig_band_for_days(array $config, int $daysAway): ?string
+{
+    foreach (sig_reminder_bands($config) as $b) {
+        if ($daysAway < $b['min_days']) {
+            continue;
+        }
+        if ($b['max_days'] !== null && $daysAway > $b['max_days']) {
+            continue;
+        }
+        return $b['id'];
+    }
+    return null;
+}
+
+function sig_band_interval(array $config, string $bandId): int
+{
+    foreach (sig_reminder_bands($config) as $b) {
+        if ($b['id'] === $bandId) {
+            return $b['min_interval_days'];
+        }
+    }
+    return 90;
+}
+
+function sig_active_threshold_days(array $config): int
+{
+    $min = null;
+    foreach (sig_reminder_bands($config) as $b) {
+        $min = $min === null ? $b['min_days'] : min($min, $b['min_days']);
+    }
+    return $min ?? 14;
+}
+
+/**
+ * Joined ≈ last seen, long ago → never-engaged priming band (default dormant).
+ */
+function sig_never_engaged_kind(array $config, array $user, int $daysAway): ?string
+{
+    $ne = $config['reminders']['never_engaged'] ?? [];
+    if (!is_array($ne) || $ne === []) {
+        return null;
+    }
+    $within = max(0, (int) ($ne['join_last_seen_within_days'] ?? 7));
+    $minAgo = max(1, (int) ($ne['min_days_ago'] ?? 100));
+    $kind = (string) ($ne['kind'] ?? 'dormant');
+    if ($daysAway < $minAgo) {
+        return null;
+    }
+    $joined = isset($user['joined_at']) ? strtotime((string) $user['joined_at']) : false;
+    $seen = isset($user['last_seen_at']) ? strtotime((string) $user['last_seen_at']) : false;
+    if ($joined === false || $seen === false) {
+        return null;
+    }
+    $gapDays = (int) floor(abs($seen - $joined) / 86400);
+    if ($gapDays > $within) {
+        return null;
+    }
+    return $kind;
 }
 
 function sig_discussion_url(array $config, int $id, string $slug): string
