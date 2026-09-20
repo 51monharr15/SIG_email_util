@@ -52,7 +52,7 @@ Edit HTML (TryIt/WYSIWYG is fine). Plain text is derived automatically. Keep `{{
 ## Logs vs database
 
 - **File log:** every person — `NOTHING … because …` or `WOULD-SEND` / `SENT` with band + subject (not full body).  
-- **Database `sig_mail_state`:** only after a **real** send (welcome time and/or last reminder kind + date).
+- **Database `sig_mail_state`:** only after a **real** send (welcome time and/or last reminder kind + date). One table only; old test tables are dropped by the install SQL.
 
 ---
 

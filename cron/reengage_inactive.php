@@ -152,14 +152,9 @@ foreach ($users as $user) {
     $result = sig_send_mail($config, $email, $msg['subject'], $msg['text'], $msg['html']);
     if ($result['ok']) {
         sig_state_mark_reminder($pdo, $uid, $kind);
-        sig_mail_log_insert($pdo, $uid, $email, $kind, null, 'sent', $msg['subject'], null, [
-            'days_away' => $daysAway,
-            'primed'    => $primed,
-        ]);
         sig_log("SENT {$kind} {$label} {$daysAway}d | {$msg['subject']}");
         $stats['sent']++;
     } else {
-        sig_mail_log_insert($pdo, $uid, $email, $kind, null, 'error', $msg['subject'], $result['error']);
         sig_log("ERROR {$kind} {$label}: {$result['error']}");
         $stats['error']++;
     }

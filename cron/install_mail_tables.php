@@ -1,6 +1,6 @@
 <?php
 /**
- * Create / verify mail utility tables.
+ * Drop unused test tables; create / verify sig_mail_state.
  *
  *   php cron/install_mail_tables.php
  */
@@ -21,7 +21,6 @@ if ($sql === false) {
     exit(1);
 }
 
-// Strip line comments; split on semicolons
 $lines = preg_replace('/^--.*$/m', '', $sql) ?? $sql;
 $parts = array_filter(array_map('trim', explode(';', $lines)));
 foreach ($parts as $statement) {
@@ -30,4 +29,4 @@ foreach ($parts as $statement) {
     }
 }
 
-sig_log('Installed/verified tables: sig_mail_state, sig_mail_log, sig_mail_prefs');
+sig_log('Dropped sig_mail_log / sig_mail_prefs if present; installed/verified sig_mail_state');

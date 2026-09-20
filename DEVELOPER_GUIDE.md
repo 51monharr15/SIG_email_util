@@ -55,10 +55,9 @@ PC → commit/push → FileZilla upload changed files (not `.git`). Keep server 
 
 ## 4. Database
 
-- **`sig_mail_state`** — source of truth (welcome_sent_at, last_kind, last_sent_at).  
-- `sig_mail_log` — optional thin history of real `sent`/`error` only.  
-- `sig_mail_prefs` — unused by default.  
-- Flarum tables: prefix `flfo_`. Utility tables: **no** `flfo_` prefix.
+- **`sig_mail_state`** — only utility table (welcome + last reminder kind/date).  
+- Install SQL **drops** unused test tables `sig_mail_log` / `sig_mail_prefs` if present.  
+- Flarum tables: prefix `flfo_`. Utility table: **no** `flfo_` prefix.
 
 Install: `php cron/install_mail_tables.php` (or phpMyAdmin + `sql/sig_mail_tables.sql`).
 

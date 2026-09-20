@@ -142,42 +142,6 @@ function sig_log(string $msg): void
 }
 
 /**
- * @param array<string, mixed>|null $meta
- */
-function sig_mail_log_insert(
-    PDO $pdo,
-    int $userId,
-    string $email,
-    string $kind,
-    ?string $tier,
-    string $status,
-    string $subject,
-    ?string $skipReason = null,
-    ?array $meta = null
-): void {
-    // Real activity only (sent / error). Dry-runs stay in the file log.
-    if ($status !== 'sent' && $status !== 'error') {
-        return;
-    }
-    $stmt = $pdo->prepare(
-        'INSERT INTO ' . sig_util_table('sig_mail_log') . '
-         (user_id, email, kind, tier, status, subject, skip_reason, meta_json, created_at)
-         VALUES (:user_id, :email, :kind, :tier, :status, :subject, :skip_reason, :meta_json, :created_at)'
-    );
-    $stmt->execute([
-        ':user_id'     => $userId,
-        ':email'       => $email,
-        ':kind'        => $kind,
-        ':tier'        => $tier,
-        ':status'      => $status,
-        ':subject'     => substr($subject, 0, 255),
-        ':skip_reason' => $skipReason,
-        ':meta_json'   => $meta === null ? null : json_encode($meta, JSON_UNESCAPED_UNICODE),
-        ':created_at'  => date('Y-m-d H:i:s'),
-    ]);
-}
-
-/**
  * @return array{welcome_sent_at:?string,last_kind:?string,last_sent_at:?string,updated_at:?string}|null
  */
 function sig_state_get(PDO $pdo, int $userId): ?array
@@ -216,17 +180,7 @@ function sig_state_mark_reminder(PDO $pdo, int $userId, string $kind): void
 function sig_already_sent_welcome(PDO $pdo, int $userId): bool
 {
     $state = sig_state_get($pdo, $userId);
-    if ($state && !empty($state['welcome_sent_at'])) {
-        return true;
-    }
-    // Legacy fallback from old sig_mail_log rows
-    $stmt = $pdo->prepare(
-        'SELECT 1 FROM ' . sig_util_table('sig_mail_log') . '
-         WHERE user_id = :uid AND kind = \'welcome\' AND status = \'sent\'
-         LIMIT 1'
-    );
-    $stmt->execute([':uid' => $userId]);
-    return (bool) $stmt->fetchColumn();
+    return $state !== null && !empty($state['welcome_sent_at']);
 }
 
 function sig_in_allowlist(array $config, string $email): bool

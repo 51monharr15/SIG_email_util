@@ -99,13 +99,9 @@ foreach ($candidates as $user) {
     $result = sig_send_mail($config, $email, $msg['subject'], $msg['text'], $msg['html']);
     if ($result['ok']) {
         sig_state_mark_welcome($pdo, $uid);
-        sig_mail_log_insert($pdo, $uid, $email, 'welcome', null, 'sent', $msg['subject'], null, [
-            'joined_at' => $user['joined_at'],
-        ]);
         sig_log("SENT welcome {$label} | {$msg['subject']}");
         $stats['sent']++;
     } else {
-        sig_mail_log_insert($pdo, $uid, $email, 'welcome', null, 'error', $msg['subject'], $result['error']);
         sig_log("ERROR welcome {$label}: {$result['error']}");
         $stats['error']++;
     }

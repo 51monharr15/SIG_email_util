@@ -53,7 +53,7 @@ After a **send** run, rows in `sig_mail_state` with `updated_at` = today were co
 
 ## Database (agreed model)
 
-### `sig_mail_state` (current state — what we use now)
+### `sig_mail_state` (only table we keep)
 
 | Column | Meaning |
 |---|---|
@@ -65,12 +65,9 @@ After a **send** run, rows in `sig_mail_state` with `updated_at` = today were co
 
 Display name for emails = nickname if set, else username. **Not** stored as the key.
 
-### Older tables (still created; no longer the source of truth)
+Old test-era tables `sig_mail_log` and `sig_mail_prefs` are **dropped** by `sql/sig_mail_tables.sql` / install — they were never live.
 
-- `sig_mail_log` — old append-only audit (dry-runs etc.). **New code does not write dry-runs here.**  
-- `sig_mail_prefs` — optional kill switch; **not** required for the “leave the forum to unsubscribe” model. Left in place unused by default.
-
-On first deploy of this restart: run `cron/install_mail_tables.php` (or apply `sql/sig_mail_tables.sql`) so `sig_mail_state` exists.
+On deploy: run the SQL in phpMyAdmin or `cron/install_mail_tables.php`.
 
 ---
 
